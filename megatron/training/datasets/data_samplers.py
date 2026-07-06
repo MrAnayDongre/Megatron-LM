@@ -46,7 +46,10 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size())
     elif args.dataloader_type == 'single':
-        if args.hybrid_context_parallel:
+        if (
+            getattr(args, "hybrid_context_parallel", False)
+            and getattr(args, "sequence_packing_scheduler", None) is None
+        ):
             batch_sampler = HybridCPMegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
@@ -55,7 +58,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 data_parallel_rank=mpu.get_data_parallel_rank(),
                 data_parallel_size=mpu.get_data_parallel_world_size())
         else:
-            # Megatron sampler
+            # Megatron sampler. Packing schedulers consume one microbatch at a
+            # time and form packed global batches themselves.
             batch_sampler = MegatronPretrainingSampler(
                 total_samples=len(dataset),
                 consumed_samples=consumed_samples,
@@ -97,9 +101,14 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     maybe_worker_init_fn = (
         worker_init_fn if args.num_workers > 0 else None
     )
-    # Torch dataloader.
-    if args.hybrid_context_parallel:
-        extra_kwargs = {"collate_fn": lambda x: x,}
+    # Packing schedulers consume variable-length dictionaries that cannot be
+    # stacked by the default collate function.
+    if (
+        getattr(args, "hybrid_context_parallel", False)
+        or getattr(args, "sequence_packing_scheduler", None) is not None
+        or getattr(args, "use_vanilla_collate_fn", False)
+    ):
+        extra_kwargs = {"collate_fn": lambda x: x}
     else:
         extra_kwargs = {}
     return torch.utils.data.DataLoader(

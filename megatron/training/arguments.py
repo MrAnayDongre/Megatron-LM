@@ -1479,6 +1479,28 @@ def validate_args(args, defaults={}):
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
+    if args.sequence_packing_scheduler is not None:
+        assert not args.hybrid_context_parallel, (
+            "--sequence-packing-scheduler and --hybrid-context-parallel are "
+            "separate scheduling paths and cannot be enabled together"
+        )
+        assert args.calculate_per_token_loss, (
+            "Sequence packing requires --calculate-per-token-loss so gradients "
+            "do not depend on packing boundaries"
+        )
+        assert args.cuda_graph_impl == "none", (
+            "Sequence packing does not support CUDA graphs without fixed-shape alignment"
+        )
+        args.variable_seq_lengths = True
+        assert args.max_seqlen_per_dp_cp_rank is not None, (
+            "--max-seqlen-per-dp-cp-rank must be set when using sequence packing"
+        )
+        packed_capacity = args.context_parallel_size * args.max_seqlen_per_dp_cp_rank
+        assert packed_capacity >= args.seq_length, (
+            f"Packed sequence capacity ({packed_capacity}) must be at least "
+            f"--seq-length ({args.seq_length})"
+        )
+
     # Data blend checks
     assert args.mock_data + \
            bool(args.data_path) + \
@@ -2126,6 +2148,9 @@ def _add_network_size_args(parser):
         "bias_dropout_fusion",
         "apply_rope_fusion",
         "mamba_training_ssm_states_dtype",
+        "max_seqlen_per_dp_cp_rank",
+        "hybrid_context_parallel",
+        "sequence_packing_scheduler",
     ]
     transformer_factory = ArgumentGroupFactory(TransformerConfig, exclude=exclude)
     transformer_group = transformer_factory.build_group(parser, "transformer configuration")
@@ -2897,6 +2922,14 @@ def _add_distributed_args(parser):
                        'all layers will share the same communication type. Users can also '
                        'specify separated types for each layer like '
                        '--cp-comm-type p2p p2p a2a a2a a2a+p2p a2a+p2p')
+    group.add_argument('--max-seqlen-per-dp-cp-rank', type=int, default=None,
+                       help='Maximum packed sequence length assigned to each DP x CP rank.')
+    group.add_argument('--hybrid-context-parallel', action='store_true', default=False,
+                       help='Balance variable-length packed samples across context-parallel ranks. '
+                       'Requires --max-seqlen-per-dp-cp-rank.')
+    group.add_argument('--sequence-packing-scheduler', type=str, default=None,
+                       choices=['dp_balanced'],
+                       help='Pack variable-length sequences across DP x CP ranks.')
     group.add_argument('--fake-process-group', action='store_true', default=False,
                        help='If set, initialize with fake distributed process group and all distributed communication operations will be skipped. \
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
@@ -3446,6 +3479,13 @@ def _add_sft_args(parser):
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
     group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
                        help='SFT prompt format.')
+    group.add_argument(
+        '--sft-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Inline JSON or a JSON file configuring synthetic SFT sequence lengths. '
+        'Supports file and lognormal distribution modes.',
+    )
     return parser
 
 def _add_logits_distillation_args(parser):
