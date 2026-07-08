@@ -1545,6 +1545,12 @@ def validate_args(args, defaults={}):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        assert not args.fp8_param_gather, (
+            "Emerging optimizer (Muon / layer-wise distributed optimizer) is incompatible with "
+            "--fp8-param-gather: its param all-gather flattens the parameters, which is not "
+            "supported for MXFP8 tensors. Remove --fp8-param-gather (MXFP8 GEMMs still run via "
+            "per-forward quantization)."
+        )
 
 
     # Make sure all functionality that requires Gloo process groups is disabled.

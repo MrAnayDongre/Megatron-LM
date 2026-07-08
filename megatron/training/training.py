@@ -1974,7 +1974,15 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["num_buckets"] = args.ddp_num_buckets
         kwargs["bucket_size"] = args.ddp_bucket_size
         kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
-        kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
+        if args.ddp_reduce_scatter_with_fp32_accumulation and not args.use_distributed_optimizer:
+            print_rank_0(
+                "WARNING: --ddp-reduce-scatter-with-fp32-accumulation requires the distributed "
+                "optimizer; use_distributed_optimizer is disabled (e.g. Muon / layer-wise "
+                "optimizer), so it is being disabled."
+            )
+        kwargs["reduce_scatter_with_fp32_accumulation"] = (
+            args.ddp_reduce_scatter_with_fp32_accumulation and args.use_distributed_optimizer
+        )
         kwargs["param_name_patterns_for_fp32_local_accumulation"] = \
             tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
         kwargs["average_in_collective"] = args.ddp_average_in_collective
