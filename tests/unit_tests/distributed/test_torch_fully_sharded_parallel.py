@@ -11,13 +11,35 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import init_method_normal, is_torch_min_version
+from megatron.core.utils import (
+    init_method_normal,
+    is_torch_min_version,
+    make_tp_sharded_tensor_for_checkpoint,
+)
 from tests.unit_tests.test_utilities import Utils
+
+try:
+    from torch.distributed import DeviceMesh
+    from torch.distributed.tensor import DTensor
+    from torch.distributed.tensor.placement_types import Shard
+
+    HAVE_DTENSOR = True
+except ImportError:
+    HAVE_DTENSOR = False
+
+try:
+    import einops
+
+    HAVE_EINOPS = True
+except ImportError:
+    HAVE_EINOPS = False
 
 
 class DummyModel(MegatronModule):
@@ -106,3 +128,118 @@ def test_fsdp2_constructor_with_process_group(init_model_parallel):
     assert _is_fsdp_wrapped_module(fsdp_model.module.module.linear)
     assert _is_fsdp_wrapped_module(fsdp_model.module.module.column_parallel_linear)
     assert not _is_fsdp_wrapped_module(fsdp_model.module.module.conv)
+
+
+@pytest.mark.skipif(not is_torch_min_version("2.4.0"), reason="FSDP2 requires PyTorch >= 2.4")
+@pytest.mark.skipif(not HAVE_EINOPS, reason="einops is not available")
+@pytest.mark.skipif(not HAVE_DTENSOR, reason="DTensor is not available")
+def test_fsdp2_swiglu_sharded_tensor_factory():
+    """
+    Test construction of a TP2 DP{N} ShardedTensor for SwiGLU.
+    """
+    # Initialize distributed with TP2.
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    tp_group = pg_collection.tp
+    tp_size = tp_group.size()
+    tp_rank = tp_group.rank()
+    dp_cp_group = pg_collection.dp_cp
+    dp_cp_size = dp_cp_group.size()
+    dp_cp_rank = dp_cp_group.rank()
+
+    # Create FSDP2 DTensor with DP only. (Implicitly TP-sharded before FSDP2 init.)
+    device_mesh = DeviceMesh.from_group(dp_cp_group, device_type="cuda", mesh_dim_names=["dp_cp"])
+    toy_dtensor = DTensor.from_local(
+        torch.randn(2, 8), device_mesh=device_mesh, placements=(Shard(dim=0),)
+    )
+    toy_dtensor.is_torch_fsdp2_param = True
+
+    # Initialize TP-DP ShardedTensor.
+    tp_dp_sh_ten = make_tp_sharded_tensor_for_checkpoint(
+        toy_dtensor,
+        "test_fsdp2_tp_swiglu_weight",
+        # SwiGLU FC1 TP & FSDP2 Sharding Dim
+        tp_axis=0,
+        replica_id=None,
+        prepend_offsets=(),
+        tp_group=tp_group,
+        dp_cp_group=dp_cp_group,
+    )
+    """
+    Before TP2-DP4 Swizzle (TP Rank 1, DP Rank 1):
+    (Pdb) tp_dp_sh_ten
+    ShardedTensor(
+        local_shape=(2, 8),
+        global_shape=(16, 8),
+        # Canonical Data Offset = 2 * (tp_rank * dp_cp_size + dp_cp_rank)
+        # = 2 * (5) = 10
+        global_offset=(10, 0),
+        axis_fragmentations=(8, 1),
+        replica_id=(0, 0, 0),
+        prepend_axis_num=0
+    )
+    """
+
+    # Test SwiGLU factory for FSDP2-TP.
+    swiglu_sh_ten_factory = apply_swiglu_sharded_factory(
+        tp_dp_sh_ten,
+        sharded_offsets=(),  # Vanilla MLP.
+        # Fused W/V.
+        singleton_local_shards=False,
+        tp_group=tp_group,
+        dp_group=dp_cp_group,
+    )
+    sh_ten_shards = swiglu_sh_ten_factory.build()
+
+    """
+    After TP2-DP4 Swizzle (TP Rank 1, DP Rank 1):
+    (Pdb) sh_ten_shards[0]
+    ShardedTensor(
+        local_shape=(2, 8),
+        global_shape=(16, 8),
+        global_offset=(6, 0),   # W/V TP-swizzled, DP-sharded!
+        axis_fragmentations=(8, 1),
+        replica_id=(0, 0, 0),
+        prepend_axis_num=0
+    )
+
+    This is a mapping from the checkpoint [W;V] rank offsets:
+
+        W_tp0_dp0 W_tp0_dp1 W_tp1_dp0 W_tp1_dp1 V_tp0_dp2 V_tp0_dp3 V_tp1_dp2 V_tp1_dp3
+        0         1         2         3         4         5         6         7
+                                      |
+                        Data Offset = 3 * 2 = 6 is just the rank offset x local shape.
+    
+    to the model [ {W_tpx; V_tpx}_dpy ] rank offsets:
+
+        W_tp0_dp0 W_tp0_dp1 V_tp0_dp2 V_tp0_dp3 W_tp1_dp0 W_tp1_dp1 V_tp1_dp2 V_tp1_dp3
+    """
+
+    # Validate FSDP2 TP-DP sharding and swizzle.
+    assert getattr(tp_dp_sh_ten, "is_torch_fsdp2_param", False)
+    assert len(sh_ten_shards) == 1
+
+    shard = sh_ten_shards[0]
+    shards_per_half = dp_cp_size // 2
+    swiglu_half_idx, half_dp_shard_idx = divmod(dp_cp_rank, shards_per_half)
+    expected_rank_offset = (
+        # W or V half of the [W; V] global data.
+        swiglu_half_idx * tp_size * shards_per_half
+        # TP Shard Index
+        + tp_rank * shards_per_half
+        # TP-DP Shard Index
+        + half_dp_shard_idx
+    )
+    expected_global_offset = expected_rank_offset * shard.local_shape[0]
+
+    assert shard.global_offset[0] == expected_global_offset
+    assert shard.axis_fragmentations[0] == tp_size * dp_cp_size
+    assert shard.global_shape[0] == tp_size * dp_cp_size * shard.local_shape[0]
+    if dp_cp_rank < shards_per_half:
+        assert shard.global_offset[0] < shard.global_shape[0] // 2
+    else:
+        assert shard.global_offset[0] >= shard.global_shape[0] // 2
+
+    # Destroy distributed.
+    Utils.destroy_model_parallel()
+    unset_num_microbatches_calculator()
